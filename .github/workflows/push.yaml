@@ -1,9 +1,10 @@
-name: Push (main)
+name: Push (Sidecar)
 
 on:
   push:
     branches:
       - main
+      - feat/ps7
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

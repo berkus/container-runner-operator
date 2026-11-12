@@ -1,17 +1,63 @@
-# This file configures Charmcraft.
-# See https://juju.is/docs/sdk/charmcraft-config for guidance.
-
 type: charm
-bases:
-  - build-on:
-    - name: ubuntu
-      channel: "22.04"
-    run-on:
-    - name: ubuntu
-      channel: "22.04"
-
+name: ratings
+summary: Kubernetes sidecar operator for the App Center Ratings service
+description: |
+  Runs the Ratings gRPC backend using Pebble, a relation-provisioned PostgreSQL
+  database, and an application-owned Juju JWT secret. Supports local development
+  and Prodstacks 7 (PS7) Juju deployments on Kubernetes.
+base: ubuntu@24.04
+platforms:
+  amd64:
+    build-on: [amd64]
+    build-for: [amd64]
+assumes:
+  - k8s-api
+  - juju >= 3.6.4
+containers:
+  ratings:
+    resource: ratings-image
+resources:
+  ratings-image:
+    type: oci-image
+    description: Ratings rock containing /bin/ratings and the ratings Pebble service
+requires:
+  database:
+    interface: postgresql_client
+    limit: 1
+  logging:
+    interface: loki_push_api
+    optional: true
+peers:
+  ratings-peers:
+    interface: ratings_peers
+config:
+  options:
+    database-name:
+      type: string
+      default: ratings
+      description: |
+        PostgreSQL SQL database name requested from the provider (not a DBaaS
+        service name or Juju offer URL). Set before relating the database.
+        Use 1-63 ASCII letters, digits, underscores or hyphens, not a leading
+        hyphen. Changing it on an existing relation blocks the workload.
+    snap-store-url:
+      type: string
+      default: https://api.snapcraft.io/v2/
+      description: Absolute HTTP(S) Snap Store API base URL, including trailing slash.
+    rust-log:
+      type: string
+      default: info,sqlx=warn,hyper=warn,reqwest=warn
+      description: Rust tracing EnvFilter; verbose filters may log sensitive workload data.
+actions:
+  rotate-jwt-secret:
+    description: |
+      Rotate the application JWT signing secret on the leader. Restarts all units
+      as peer changes propagate; existing JWTs become invalid. No secret is returned.
 parts:
   charm:
-    charm-binary-python-packages:
-      - psycopg[binary]
-      - PyYAML
+    plugin: charm
+    source: .
+    charm-entrypoint: src/charm.py
+    charm-requirements: [requirements.txt]
+    charm-strict-dependencies: true
+    charm-binary-python-packages: [pydantic-core]

@@ -1,9 +1,10 @@
-name: Pull Request (Main)
+name: Pull Request (Sidecar)
 
 on:
   pull_request:
     branches:
       - main
+      - feat/ps7
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

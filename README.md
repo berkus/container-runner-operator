@@ -1,239 +1,293 @@
-# Container Runner charm
+# Ratings Kubernetes sidecar operator
 
-[![Push (main)](https://github.com/canonical/app-center-ratings-operator/actions/workflows/push.yaml/badge.svg)](https://github.com/canonical/app-center-ratings-operator/actions/workflows/push.yaml)
-[![codecov](https://codecov.io/gh/canonical/container-runner-operator/graph/badge.svg?token=YsqEQHNIm7)](https://codecov.io/gh/canonical/container-runner-operator)
+> **Branch warning:** `feat/ps7` replaces this repository's root machine charm
+> with the Ratings Kubernetes sidecar. The legacy Docker/Watchtower machine charm
+> remains on [`main`](https://github.com/canonical/container-runner-operator/tree/main).
+> This is not an in-place machine-to-Kubernetes upgrade; do not refresh an existing
+> machine deployment with this branch's artifact.
 
-The Container Runner charm aims to provide a configurable Charm for deploying simple backend web service and database setups onto Juju infrastructure. The aim is to make it easier to deploy simple web applications without the need to create dedicated Charms for each service.
+A standalone sidecar operator for the existing
+[App Center Ratings](https://github.com/ubuntu/app-center-ratings) rock
+(`/bin/ratings`, Pebble service `ratings`). All charm code, vendored libraries,
+dependency locks, and tests are self-contained at this repository's root. The
+charm does **not** deploy PostgreSQL, change the rock, create an ingress, or install
+observability agents. It is specific to Ratings, not a generic container runner.
+The same charm artifact is intended for local development and Prodstacks 7 (PS7)
+Juju deployments on Kubernetes; environment-specific configuration, database offers,
+and OCI resources are supplied at deployment time. See the TLS and ingress
+limitations below before exposing the service.
 
-The Container Runner Charm provides:
-- A running Docker engine snap for running OCI images.
-- The ability to stop and restart the managed OCI image with different configuration.
-- Configurable port setup for opening ports.
-- Database relations passed into the running OCI image via environment variables.
-- The ability to pass secrets into your running OCI image via environment variables.
-- An instance of Watchtower to automatically update your OCI image when new images are pushed.
+`charmcraft.yaml` is the sole source of charm metadata, configuration, and actions;
+there are no separate `metadata.yaml`, `config.yaml`, or `actions.yaml` files.
 
-## Table of Contents
+## Requirements and packing
 
-1. [Explanation](#explanation)
-2. [Reference](#reference)
-    - [Configuration Values](#configuration-values)
-3. [How-to Guides](#how-to-guides)
-    - [How to Setup a Development Environment](#how-to-setup-a-development-environment)
-    - [How to Build the Charm Locally](#how-to-build-the-charm-locally)
-    - [How to Deploy a Simple Web Application](#how-to-deploy-a-simple-web-application)
-    - [How to Pass Secrets into the Running Container](#how-to-pass-secrets-into-the-running-container)
-    - [How to Pass Non-Secret Config into the Running Container](#how-to-pass-non-secret-config-into-the-running-container)
-    - [How to Connect to a Database](#how-to-connect-to-a-database)
+- Juju **3.6.4+**, including the lab's **3.6.29**. Check start/stop support requires
+  3.6.4; the charm declares that minimum in `assumes`.
+- Charmcraft **4.5.0**, Ubuntu **24.04**, Python **3.12**, Kubernetes sidecars.
+- The declared build/deployment platform is **amd64** only. An arm64 rock and
+  additional platform declaration would be needed for arm64.
+- A compatible `postgresql_client` provider. The local lab uses PostgreSQL-k8s
+  **16/stable** via its modern `database` endpoint; PS7 uses an approved DBaaS offer.
 
-# Explanation
+Build from this repository's root, independently of the application checkout:
 
-The Container Runner charm works by installing the Docker Snap on install followed by pulling and running the Watchtower image. Watchtower allows for other OCI images being run by the Docker Snap to be automatically updated to their latest version. Next image specified under the `container-image-uri` config value is pulled and run.
-
-The Container Runner charm is a machine charm, meaning that its required deployment environment is lxd.
-
-Much of the lifecycle management of the Container Runner Charm is triggered by [Juju hooks](https://juju.is/docs/juju/hook).  Some key hooks that are used in this Charm include:
-- `database_created`: Run when the Charm is related to a database. Will connect the Charm to the database to acquire credentials, then restart  the managed OCI image with an additional environment variable that can be used to connect to the database: `APP_POSTGRES_URI`
-- `config_changed`: Run when the Juju config command is called and is used to pass configuration into the Charm. Due to how secrets work in Juju, this is also where secrets are passed in via the `env-vars` config value, which takes a url to the secret you with to pass in.
-
-# Reference
-
-## Configuration Values
-
-The following configuration options are available on the Container Runner charm:
-
-### `container-port`
-- **Type**: `int`
-- **Default**: `80`
-- **Description**:  
-  The internal port on which the application inside the container listens for web traffic.
-
-### `host-port`
-- **Type**: `int`
-- **Default**: `80`
-- **Description**:  
-  The external port on the host machine that maps to the container's internal port, allowing access to the application from outside the container.
-
-### `container-image-uri`
-- **Type**: `string`
-- **Default**: `nginxdemos/hello`
-- **Description**:  
-  The image or image URI that will be run by the container runner.
-
-### `database-expected`
-- **Type**: `boolean`
-- **Default**: `false`
-- **Description**:  
-  A flag that determines if a database relation should be waited for before starting the container runner.
-
-### `env-vars`
-- **Type**: `secret`
-- **Description**:  
-  Expects the string content of a `.env` file, with each variable on a new line.
-
-### Setting up proxy configuration
-
-In order to pass `http_proxy` and `https_proxy` settings into the charm, and have them used by the charm and Docker daemon, set the `juju-https-proxy` and `juju-http-proxy` model configuration settings:
-
-```
-juju model-config juju-https-proxy=http://my.proxy:1234
-juju model-config juju-http-proxy=http://my.proxy:1234
+```sh
+charmcraft pack --platform amd64
 ```
 
-These configuration settings are scoped to the model, not the unit. More on Juju model config can be found [here](https://juju.is/docs/juju/juju-model-config).
+This produces **`ratings_amd64.charm`**. Repack after changing the charm. Normal
+packing uses Charmcraft's isolated build environment; it does not deploy or
+publish anything. CI packs on a disposable Ubuntu 24.04 runner using the
+Charmcraft `4.x/stable` channel and `--destructive-mode`, without machine-charm
+integration tests. Destructive mode can install build packages on that runner;
+it is not a command to run on your everyday host.
 
-#  How-to guides
- 
-The following are a series of how-to's to guide you through managing and deploying a containerized application via the Container Runner charm.
+The image is **not** included in the charm archive. Deployment must supply the
+`ratings-image` OCI resource: the registry reference of the already-built rock
+that is accessible to the Kubernetes nodes. Registry/import/rollout tooling is
+deliberately outside this operator repository's scope.
 
-## How to setup a development environment
+The Multipass lab and `just vm charm-pack`, `just vm charm-test`, and
+`just vm rollout` recipes belong to the separate
+[application repository](https://github.com/ubuntu/app-center-ratings), not this
+repository. Those recipes now use a sibling standalone operator checkout instead
+of the former application-local `charm/` directory. Set host `RATINGS_OPERATOR_REPO`
+if the checkout is elsewhere; `just create` mounts both repositories, while
+`just up` followed by `just operator-mount` attaches the operator to an existing
+lab. No recipe switches this checkout's branch. See the application's
+[lab guide](https://github.com/ubuntu/app-center-ratings/blob/main/doc/charming.md)
+for registry setup, dependency models, host forwarding, and smoke checks. Rollout
+can publish images and deploy/refresh applications; it is not part of this
+repository's build/test workflow. Keep deployment artifacts outside hidden
+folders because strictly confined Juju cannot read archives under `.cache`.
 
-The Juju team good documentation on how to setup a development environment which can be found [here](https://juju.is/docs/sdk/dev-setup). This should get you to a place where you have a virtual machine setup with the `juju` and `charmcraft` cli tools, as well as a bootstrapped Juju environment with a micro-k8s and lxd controller for deploying charms to.
+## Endpoints and configuration
 
-A key thing to keep in mind is that the Container Runner charm is a machine charm, not a Kubernetes charm. The main consequence of this is that you will need to make sure you are targeting a lxd Juju controller when deploying locally, not a micro-k8s controller.
+| Endpoint | Role / interface | Purpose |
+| --- | --- | --- |
+| `database` | requires / `postgresql_client`, limit 1 | The configured SQL database (`ratings` by default) and relation-scoped credentials |
+| `logging` | optional requires / `loki_push_api` | Native Pebble workload stdout/stderr forwarding to COS Loki |
+| `ratings-peers` | peer / `ratings_peers` | Shared JWT secret reference and rotation notification |
 
-You can check which controller you Juju cli tool is targeting by running:
-```
-juju controllers
-```
+After deployment by the rollout owner, the database relation is:
 
-You will want to make sure the controller you are targeting has the Cloud/Region of `localhost/localhost`
-
-You can switch the controller you are targeting by running:
-```
-juju switch <controller-name>
-```
-## How to build the Charm locally
-
-Until the Container Runner charm is published to Charmhub, is will need to be built and deployed from the packed charm artifact. 
-
-The Charm can be build via the Charmcraft snap. Charmcraft can be installed via:
-```
-sudo snap install charmcraft --classic
-```
-
-To pack the Container Runner charm, navigate to the project root and run:
-```
-charmcraft pack
-```
-
-This will produce a `.charm` artifact that can be installed on a Juju lxd controller.
-
-## How to deploy a simple web application
-
-The charm built in the previous step can be deployed using the `juju deploy` command.
-
-```
-juju deploy ./container-runner_ubuntu-22.04-amd64.charm --config container-image-uri=nginxdemos/hello --config host-port=80 --config container-port=80
+```sh
+juju integrate -m ratings-k8s:ratings-dev \
+  ratings:database postgresql:database
 ```
 
-There are a few key things to pull of of this command.
-- You don't need to pass in command line arguments for all your configuration, and can instead pass in a yaml-formatted application config file.
-- The path to the charm is prefaced with `./` to tell Juju the charm is available locally and not to search for it on charmhub.
-- The `container-image-uri` will point the Docker snap to pull the `nginxdemos/hello` container from Dockerhub, which when curled returns a hello world response.
-- The `host-port` and `container-port` config values are both set at 80
-	- This will be passed along to the Docker snap when running the OCI image to [publish ports](https://docs.docker.com/get-started/docker-concepts/running-containers/publishing-ports/). (equivalent to `-p 80:80`)
-	- Use the `host-port` to open a port for external traffic to the charm.
+The lab's PostgreSQL application is named `postgresql`. No admin password,
+extra roles, or superuser privileges are requested. In the lab, the provider
+creates the database/user; the app owns its schema.
 
-Running `juju status` will show the current states of the model. After a few minutes, the charm should be installed and setup. Our `container-runner` [app](https://juju.is/docs/juju/application) is deployed and active, and has a deployed and active [unit](https://juju.is/docs/juju/unit):
+PS7 staging instead uses an existing **DBaaS-managed SQL database**,
+`stg-app-center-rating`. Set `database-name` before relating the application and
+use the approved staging provider/offer. The production SQL database is
+`prod-app-center-rating`, recorded for inventory/export only; it is not the
+staging connection target. SQL names are not Juju offer URLs or DBaaS service
+identifiers. The managed provider must expose a compatible `postgresql_client`
+relation and authorise this application to use that database; confirm credentials,
+TLS, network access, and migration permissions with the DBaaS owners. This charm
+does not provision a DBaaS instance or support arbitrary static connection secrets.
 
-```
-ubuntu@charm-dev-vm:~$ juju status
-Model        Controller  Cloud/Region         Version  SLA          Timestamp
-welcome-lxd  lxd         localhost/localhost  3.5.3    unsupported  14:46:03+02:00
+For COS in the separate `cos-lite` model, offer the Loki provider's `logging`
+endpoint from that model and integrate/consume that offer at **`ratings:logging`**
+in `ratings-dev`. Use the actual Loki application and offer URL from that model.
+No metrics or tracing endpoint is advertised: Ratings has no implemented metrics
+or trace integration here. The Canonical log-forwarding library adds Juju model,
+application, unit, and charm labels and disables targets when the relation goes
+away. It uses Pebble's existing Loki support, not a Promtail binary or sidecar.
+Private-CA Loki HTTPS is not configured by this charm; use an HTTP lab endpoint
+or a certificate trusted by Pebble's container trust store.
 
-App               Version  Status  Scale  Charm             Channel  Rev  Exposed  Message
-container-runner           active      1  container-runner             2  no       
+Config options:
 
-Unit                 Workload  Agent  Machine  Public address  Ports   Message
-container-runner/2*  active    idle   71       10.191.96.77    80/tcp  
+- `database-name`: defaults to `ratings` to preserve the local lab. Requests this
+  SQL database through the relation, verifies the provider's returned name, and
+  uses it in `APP_POSTGRES_URI`. Supports 1-63 ASCII letters, digits, underscores,
+  or hyphens, with no leading hyphen. PS7 staging sets `stg-app-center-rating`.
+  Set it at initial deployment, before creating the database relation. Changing
+  it on an existing relation **blocks and stops the workload without retargeting
+  the relation**; restore the previous value to recover. A database move needs a
+  separately reviewed data/credential plan, not an ordinary config toggle. Do not
+  remove/recreate a managed database relation without checking its data lifecycle.
+- `snap-store-url`: defaults to `https://api.snapcraft.io/v2/`; must be an absolute
+  HTTP(S) URL ending in `/`, with no credentials, query, or fragment. Requests
+  from the service go to that URL: the default requires network access to the
+  public Snap Store.
+- `rust-log`: defaults to `info,sqlx=warn,hyper=warn,reqwest=warn`, passed as
+  `RUST_LOG`. Non-empty single-line Rust EnvFilter directives are supported.
+  Arbitrary EnvFilter grammar is interpreted by Rust, not reimplemented in
+  Python. Avoid verbose SQL/client debug filters: workload logs may then contain
+  sensitive request data. Those logs are shared with COS when related.
 
-Machine  State    Address       Inst id         Base          AZ  Message
-71       started  10.191.96.77  juju-994b56-71  ubuntu@22.04      Running
-```
+The service receives:
 
-From here running curl against the public address of the active unit will respond with a relatively verbose hello world:
-```
-ubuntu@charm-dev-vm:~$ curl http://10.191.96.77:80
-<!DOCTYPE html>
-<html>
-<head>
-<title>Hello World</title>
-...
-```
-
-## How to pass secrets into the running container
-
-There are a few different types of secrets in Juju. The Container Runner charm makes use of a [user secret](https://juju.is/docs/juju/secret#heading--user) to pass secrets into a charm, and then into the container the charm is managing. 
-
-> [!IMPORTANT]
-> Secrets will be passed into the container as environment variables for the application within the container to read.
-
-A consequence of secret life cycles in Juju requires the Container Runner charm to first be deployed before the secret can be passed in. This is because deployed applications must first be granted access to a secret before it can read it, and only a running application can be targeted for granting access to a secret. 
-
-Lets say we want to pass the secrets `API_KEY=foo` and `JWT_TOKEN=bar` into our running container in an instance of the Container Runner.
-
->[!NOTE]
-> Secrets can only be of type `string`. As the Container Runner charm needs to take in an arbitrary list of secrets to pass in through to the container, secrets need to be created with the name `env-vars` and the content of a valid `.env` file, including the new line formatting.
-
-First [add the secret](https://juju.is/docs/juju/manage-secrets#heading--add-a-secret):
-```
-juju add-secret my-secret env-vars="API_KEY=foo
-JWT_TOKEN=bar"
-```
-
-Juju will return the address of your newly created secret:
-```
-secret:crcqo7t17ppj98olptsg
-```
- 
- You can also view all available secrets by running:
-```
- juju secrets
+```text
+APP_HOST=0.0.0.0
+APP_PORT=8080
+APP_POSTGRES_URI=<relation-generated, percent-encoded SQLx URI>
+APP_JWT_SECRET=<application-owned Juju secret>
+APP_SNAPCRAFT_IO_URI=<snap-store-url>
+RUST_LOG=<rust-log>
 ```
 
-Once the secret is created and the charm is deployed, the charm can be granted access to the secret:
-```
-juju grant-secret my-secret container-runner
-```
+### TLS scope
 
-While this grants the charm access to view the secret, it does not pass the charm the secret. To do that update the charm's config with the address of the secret:
-```
-juju config container-runner env-vars=secret:crcqo7t17ppj98olptsg
-```
+The Ratings **gRPC listener is currently plaintext in all environments**, including
+PS7. `APP_TLS_KEY_PATH` and `APP_TLS_KEYCHAIN_PATH` are left unset. Port **8080/TCP** is opened using
+`unit.set_ports(8080)`; that does not create external ingress or imply TLS.
+Do not expose this deployment on an untrusted network. Production listener TLS,
+certificate relations, ingress, and access policy are not implemented here.
 
-## How to pass non-secret config into the running container
+Database TLS is handled separately. With `tls=False` (or no TLS flag), the SQLx
+URI uses `sslmode=disable`, matching the lab's default. With `tls=True`, the charm
+requires the provider's `tls-ca`, writes it to
+`/etc/ratings/postgresql-ca.crt`, and uses `sslmode=verify-full` plus
+`sslrootcert`. The provider endpoint hostname must match the certificate. Missing
+CA data blocks the service rather than silently disabling verification. CA
+rotation restarts the app even when the URI is unchanged. Credentials and TLS
+fields are read through Canonical `data_interfaces`, including Juju secrets
+where negotiated; passwords/usernames are percent-encoded independently.
 
-[Juju config values](https://juju.is/docs/juju/juju-config) need to be defined at charm compilation. As a result, they are not suitable for the Container Runner charm's use case of passing in arbitrary configuration to the running container.
+### JWT ownership and rotation
 
-To solve this, the Container Runner charm makes use of [Juju resources](https://juju.is/docs/juju/juju-resources) to provide the charm with a `.env` file that will be parsed and its values passed into the environment of the running container.
+The leader generates 48 cryptographically random bytes and encodes them with
+**standard Base64** (`base64.b64encode`, not URL-safe Base64), matching the
+`from_base64_secret` decoders in the application's
+[`src/jwt.rs`](https://github.com/ubuntu/app-center-ratings/blob/main/src/jwt.rs). The signing key is stored once in an
+**application-owned Juju secret**, labelled `ratings-jwt`. Rotation uses the same
+standard Base64 encoding. Only its ID and a non-secret generation marker are
+published in the peer application databag.
+All units of the application can access the same secret; no per-unit keys and no
+plaintext peer credentials are used. Leader changes, charm upgrades, and ordinary
+configuration hooks reuse it. The leader also recovers the existing labelled
+secret if publication was interrupted. A missing *published* secret is never
+silently regenerated.
 
-To deploy a charm with config provided by a Juju resource, first create a valid `.env` file. ie:
-```env
-LOG_LEVEL=info
-ENV=dev
-```
-**TODO: how to obtain a resource from `charmhub.io`**
+Run the action on the **current leader** to rotate deliberately:
 
-Then, when deploying the Container Runner charm, pass in a resource argument, specifying the `.env` file:
-```
-juju deploy ./container-runner_ubuntu-22.04-amd64.charm --resource env-file=/path/to/env-file.env
-```
-
-## How to connect to a database
-
-Database connections are passed through to the running OCI image the `APP_POSTGRES_URI` environment variable. The application running in the container is restricted to receiving the connection string via this environment variable.
-
-The connection string will come in the format:
-`postgresql://{username}:{password}@{endpoints}/ratings`
-**FIXME: generalize beyond ratings**
-
-To trigger the event that will have this connection string passed into the running container, the Container Runner charm will need to be [related](https://juju.is/docs/juju/relation) to a postgresql charm.
-
-```
-juju relate postgresql container-runner
+```sh
+juju run -m ratings-k8s:ratings-dev ratings/0 rotate-jwt-secret
 ```
 
-> [!NOTE]
-> It is recommended to make use of the `database-expected` config value to indicate to the Container Runner charm to wait for a database relation before attempting to run the managed container.
+Replace `ratings/0` with the leader if necessary. The action returns only
+`rotated: true`, not the secret. It updates the existing secret and peer generation
+marker; the leader reconciles immediately and other units restart as peer changes
+propagate. Application secret owners do not receive Juju `secret-changed`, so
+peer notification is essential. Units use Ops `Secret.peek_content()` to read the
+latest revision without the owner-invalid `refresh=True`. Relevant external
+`secret-changed` events and database secret rotations are also handled.
 
+**Rotation invalidates existing JWTs**, and units may temporarily use different
+revisions while hooks propagate. There is no dual-key grace period. Accidental
+secret deletion stops the workload; restoring secret availability or an explicit
+operator-directed recovery is required. Database/JWT values necessarily enter the
+workload's Pebble environment, which must be treated as sensitive. Do not share
+unredacted `pebble plan`, environment dumps, or debug logs. The charm neither logs
+credentials nor copies them into stored state or relation databags.
+
+## Lifecycle and migrations
+
+Before database credentials and the shared JWT are available, the charm disables
+and stops even the image's default startup-enabled service. Invalid configuration
+blocks; pending database data, unavailable secrets, container connectivity, or
+readiness waits. Database relation removal stops Ratings, disables its check,
+erases the stale service environment/CA file, and closes the port. If Pebble is
+unreachable at removal, the port is closed immediately and stopping is retried
+once it is reachable. Database restoration reconfigures and starts the service.
+
+A `ready`-level **TCP Pebble check** probes `127.0.0.1:8080` every five seconds,
+with a two-second timeout and failure threshold one. A unit becomes Active only
+when Pebble reports the service running and its check up. If an UP check has
+zero successes or no success count, the charm also confirms the listener with a
+bounded two-second TCP connection from the same pod before setting Active. A
+failed or timed-out connection keeps the unit Waiting; missing, DOWN, or inactive
+checks are never accepted as ready. This permits Active during the initial
+post-replan health assessment without waiting for `update-status`: the first
+success of an initially UP check does not emit a check-recovered event. There are
+no sleeps or probe retry loops. Checks are reset when a service is restarted so
+successes from the previous process cannot establish readiness for the new one.
+Check-failed/recovered events and `update-status` update health; a check-failed
+event reconciles without restarting an unchanged, still-running service. Pebble
+restarts crashed services with backoff. Unchanged configuration does not restart
+Ratings.
+This is listener readiness, **not** a continuous DB transaction or end-to-end
+Snap Store health test. DB/Snap Store outages after startup can affect requests
+without bringing the TCP check down.
+
+In the existing application source,
+[`src/main.rs`](https://github.com/ubuntu/app-center-ratings/blob/main/src/main.rs)
+calls `check_db_conn()` before `grpc::run_server()`, and
+[`src/db/mod.rs`](https://github.com/ubuntu/app-center-ratings/blob/main/src/db/mod.rs)
+executes
+`sqlx::migrate!("sql/migrations").run(&pool)` while initialising the pool. The rock
+therefore embeds migrations and runs them before opening the listener. In the
+locked **SQLx 0.8.6**, `sqlx-core/src/migrate/migrator.rs` enables locking by default
+and calls `conn.lock()`/`unlock()`; `sqlx-postgres/src/migrate.rs` uses
+`pg_advisory_lock`/`pg_advisory_unlock` with a database-derived lock ID. Concurrent
+units serialize migrations through PostgreSQL itself. **No explicit charm
+migration leader, migration Job, or extra PostgreSQL Python driver is necessary.**
+
+## Dependencies, provenance, and tests
+
+Unmodified, tracked Canonical libraries are pinned by commit, `LIBID`, API/patch,
+and SHA-256 in `libraries.lock.json`:
+
+- `charms.data_platform_libs.v0.data_interfaces`, **API 0 / patch 62**, commit
+  `87e246a5392e9d3dd5c084a824a83c4bc1c34b77`; `PYDEPS`: `ops>=2.0.0`.
+- `charms.loki_k8s.v1.loki_push_api`, **API 1 / patch 35**, commit
+  `dbc2e7d78fcde4be11ae5328e7c882904befadf3`; `PYDEPS`: `cosl`.
+
+These pinned versions have no other mandatory charm-library imports. The Loki
+library imports `cosl` for topology/rules helpers (the library's older prose about
+fetching `juju_topology` does not match these current imports). Optional
+`cryptography`/`psycopg` code paths in `data_interfaces` are not needed for this
+same-model PostgreSQL consumer; it performs no direct database operations.
+The sidecar code and tests were copied from `ubuntu/app-center-ratings/charm`
+without modification, including its **GPL-3.0** [`LICENSE`](LICENSE). This migration
+does not relicense that code as Apache. Apache-2.0 licensing for vendored Canonical
+libraries is preserved in their headers, [`lib/LICENSE.loki-k8s`](lib/LICENSE.loki-k8s),
+and [`LICENSE.apache-2.0`](LICENSE.apache-2.0). The latter also preserves the original
+repository's Copyright 2023 Canonical license notice for retained repository
+infrastructure. The legacy machine implementation remains on `main` under its
+original license. The repository's Canonical CLA policy still applies; see
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
+`requirements.in` pins **Ops 2.23.2** and **cosl 1.11.3**. `requirements.txt` pins
+all 14 runtime packages, including cosl's pydantic, diskcache, tenacity, PyYAML,
+and typing dependencies and Ops' websocket/import metadata/OpenTelemetry API
+dependencies. The latter is an Ops dependency, not a tracing integration.
+Charmcraft uses strict dependency resolution; `pydantic-core` is binary-installed.
+Development tools and their closure are separately locked in
+`requirements-dev.txt`.
+
+From this repository's root (Python 3.12 is the build/CI baseline):
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python -m pytest -q --cov=charm --cov-report=term-missing
+.venv/bin/ruff check src tests
+.venv/bin/ruff format --check src tests
+```
+
+The migrated suite contains **110 unit tests** and targets **99% charm-code
+coverage**. It includes immutable database-name guards before the relation
+library's eager writes, standard-Base64 JWT creation/rotation, zero/unknown
+success counts with successful, refused, and timed-out TCP probes, non-UP checks,
+check events without service restarts, and readiness reset after restart.
+CI runs these offline tests, Ruff lint/format checks, and packs the charm; it does
+not deploy, run Docker/LXD workload tests, or publish artifacts to a registry or
+Charmhub. Optional `tox` commands use the same locked dependencies and
+`pyproject.toml` configuration; see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+The Harness tests run **offline after dependency installation**, using the real
+vendored libraries and fake Juju/Pebble/database data. They cover provisioning,
+secret-backed and plaintext credentials, URI encoding, TLS/CA rotation, stable
+leader/follower JWT ownership and rotation, invalid configuration, readiness,
+ports, stop/recovery, disconnected containers, safe actionable failures, and
+real Loki target/label/removal behaviour. The vendored checksums are also tested.
+Upstream `JujuVersion.from_environ()` deprecation warnings are expected with this
+Ops version; vendored libraries are not modified to suppress them.
