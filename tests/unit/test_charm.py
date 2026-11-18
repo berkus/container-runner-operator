@@ -10,12 +10,14 @@ import ops
 import pytest
 import yaml
 from charms.data_platform_libs.v0.data_interfaces import DatabaseRequires
+from charms.traefik_k8s.v0.traefik_route import TraefikRouteRequirer
 from ops import pebble
 from ops.testing import ActionFailed, Harness
 
 from charm import (
     CA_PATH,
     DATABASE,
+    INGRESS,
     JWT_GENERATION,
     JWT_ID,
     JWT_LABEL,
@@ -26,6 +28,7 @@ from charm import (
     ConfigurationError,
     RatingsCharm,
     postgres_uri,
+    validate_external_hostname,
 )
 
 METADATA = yaml.safe_load((Path(__file__).parents[2] / "charmcraft.yaml").read_text())
@@ -827,6 +830,320 @@ def test_loki_relation_before_container_ready_is_reconciled_on_pebble_ready(harn
     database(harness)
     harness.container_pebble_ready(SERVICE)
     assert "loki/0" in harness.get_container_pebble_plan(SERVICE).log_targets
+
+
+def ingress_config(h, relation_id):
+    return yaml.safe_load(h.get_relation_data(relation_id, h.model.app.name)["config"])
+
+
+def expected_ingress(h, hostname):
+    name = f"ratings-{h.model.uuid}-{h.model.app.name}-grpc"
+    return {
+        "http": {
+            "routers": {
+                name: {
+                    "rule": f"Host(`{hostname}`)",
+                    "entryPoints": ["websecure"],
+                    "tls": {},
+                    "service": name,
+                }
+            },
+            "services": {
+                name: {"loadBalancer": {"servers": [{"url": f"h2c://{h.model.app.name}:8080"}]}}
+            },
+        }
+    }
+
+
+def test_ingress_metadata_is_optional_and_defaults_to_no_hostname():
+    assert METADATA["requires"][INGRESS] == {
+        "interface": "traefik_route",
+        "limit": 1,
+        "optional": True,
+    }
+    assert METADATA["config"]["options"]["external-hostname"]["type"] == "string"
+    assert METADATA["config"]["options"]["external-hostname"]["default"] == ""
+
+
+@pytest.mark.parametrize("hostname", ["", "ratings.localhost", "not/a/hostname"])
+def test_ingress_is_optional_and_unused_config_does_not_affect_backend(harness, hostname):
+    database(harness)
+    original_env = environment(harness)
+    with patch.object(ops.Container, "stop") as stop:
+        harness.update_config({"external-hostname": hostname})
+        mark_ready(harness)
+    stop.assert_not_called()
+    assert isinstance(harness.model.unit.status, ops.ActiveStatus)
+    assert environment(harness) == original_env
+    assert harness.charm.traefik_route is None
+
+
+@pytest.mark.parametrize("hostname", ["ratings.localhost", "ratings.staging.ubuntu.com"])
+def test_ingress_publishes_exact_raw_tls_h2c_route_after_begin(harness, hostname, caplog):
+    database(harness, secret=True)
+    original_env = environment(harness)
+    harness.update_config({"external-hostname": hostname})
+    assert harness.charm.traefik_route is None
+    relation_id = harness.add_relation(INGRESS, "traefik")
+    assert isinstance(harness.charm.traefik_route, TraefikRouteRequirer)
+    assert harness.charm.traefik_route.is_ready()
+    assert ingress_config(harness, relation_id) == expected_ingress(harness, hostname)
+    data = harness.get_relation_data(relation_id, harness.model.app.name)
+    assert set(data) == {"raw", "config"}
+    assert data["raw"] == "True"
+    # Exact equality also excludes PathPrefix/StripPrefix, middleware, redirects,
+    # HTTP fallback routers, static config and per-pod endpoints.
+    exposed = json.dumps(data) + caplog.text
+    for secret in (original_env["APP_JWT_SECRET"], DB_DATA["password"], DB_DATA["username"]):
+        assert secret not in exposed
+    assert "secret:" not in exposed
+    assert environment(harness) == original_env
+    mark_ready(harness)
+    assert isinstance(harness.model.unit.status, ops.ActiveStatus)
+
+
+@pytest.mark.parametrize(
+    "app,model_uuid",
+    [
+        ("staging-ratings", "11111111-1111-4111-8111-111111111111"),
+        ("other-ratings", "11111111-1111-4111-8111-111111111111"),
+        ("staging-ratings", "22222222-2222-4222-8222-222222222222"),
+    ],
+)
+def test_ingress_uses_model_app_identity_and_actual_service_name(harness, app, model_uuid):
+    fresh = Harness(
+        RatingsCharm,
+        meta=yaml.safe_dump(METADATA | {"name": app}),
+        config=yaml.safe_dump(METADATA["config"]),
+    )
+    try:
+        fresh.set_model_uuid(model_uuid)
+        fresh.set_leader(True)
+        fresh.update_config({"external-hostname": "ratings.staging.ubuntu.com"})
+        # Also cover a relation that already exists when the charm initialises.
+        relation_id = fresh.add_relation(INGRESS, "shared-traefik")
+        fresh.begin()
+        fresh.charm.on.upgrade_charm.emit()
+        config = ingress_config(fresh, relation_id)
+        assert config == expected_ingress(fresh, "ratings.staging.ubuntu.com")
+        assert list(config["http"]["routers"]) == [f"ratings-{model_uuid}-{app}-grpc"]
+    finally:
+        fresh.cleanup()
+
+
+@pytest.mark.parametrize(
+    "hostname",
+    [
+        "ratings.localhost",
+        "RATINGS.Staging.Ubuntu.COM",
+        "a",
+        "0-1.example",
+        "xn--bcher-kva.example",
+        "a" * 63 + ".example",
+        ".".join(["a" * 63] * 3 + ["b" * 61]),
+    ],
+)
+def test_ingress_accepts_dns_boundaries_and_normalises_case(harness, hostname):
+    assert validate_external_hostname(hostname) == hostname.lower()
+    harness.update_config({"external-hostname": hostname})
+    relation_id = harness.add_relation(INGRESS, "traefik")
+    assert ingress_config(harness, relation_id) == expected_ingress(harness, hostname.lower())
+
+
+@pytest.mark.parametrize(
+    "hostname",
+    [
+        "",
+        "https://ratings.localhost",
+        "ratings.localhost:443",
+        "ratings.localhost/path",
+        "*.ratings.localhost",
+        "ratings.localhost`) || Host(`attacker.example",
+        "ratings.localhost`",
+        "ratings.localhost?foo=bar",
+        "ratings.localhost#fragment",
+        "user@ratings.localhost",
+        " ratings.localhost",
+        "ratings.localhost ",
+        "ratings.localhost\n",
+        "ratings.\nlocalhost",
+        ".ratings.localhost",
+        "ratings.localhost.",
+        "ratings..localhost",
+        "-ratings.localhost",
+        "ratings-.localhost",
+        "ratings_localhost",
+        "ratíngs.localhost",
+        "K.localhost",
+        "ratings\x00.localhost",
+        "a" * 64 + ".localhost",
+        ".".join(["a" * 63] * 3 + ["b" * 62]),
+    ],
+)
+def test_ingress_bad_hostname_withdraws_stale_route_and_recovers(harness, hostname, caplog):
+    database(harness)
+    harness.update_config({"external-hostname": "ratings.localhost"})
+    relation_id = harness.add_relation(INGRESS, "traefik")
+    original_env = environment(harness)
+    with patch.object(ops.Container, "stop") as stop:
+        harness.update_config({"external-hostname": hostname})
+        mark_ready(harness)
+        assert isinstance(harness.model.unit.status, ops.BlockedStatus)
+        assert "external-hostname" in harness.model.unit.status.message
+        assert ingress_config(harness, relation_id) == {"http": {"routers": {}, "services": {}}}
+        assert harness.get_relation_data(relation_id, harness.model.app.name)["raw"] == "True"
+        assert harness.charm.container.get_service(SERVICE).is_running()
+        assert environment(harness) == original_env
+        harness.update_config({"external-hostname": "ratings.staging.ubuntu.com"})
+        mark_ready(harness)
+    stop.assert_not_called()
+    assert isinstance(harness.model.unit.status, ops.ActiveStatus)
+    assert ingress_config(harness, relation_id) == expected_ingress(
+        harness, "ratings.staging.ubuntu.com"
+    )
+    assert original_env["APP_JWT_SECRET"] not in caplog.text
+    assert DB_DATA["password"] not in caplog.text
+
+
+@pytest.mark.parametrize("leader", [True, False])
+def test_ingress_related_without_hostname_blocks_but_keeps_backend(harness, leader):
+    database(harness)
+    harness.set_leader(leader)
+    relation_id = harness.add_relation(INGRESS, "traefik")
+    mark_ready(harness)
+    assert isinstance(harness.model.unit.status, ops.BlockedStatus)
+    assert (
+        harness.model.unit.status.message == "Set external-hostname when traefik-route is related"
+    )
+    assert harness.charm.container.get_service(SERVICE).is_running()
+    if leader:
+        assert ingress_config(harness, relation_id) == {"http": {"routers": {}, "services": {}}}
+    else:
+        assert harness.get_relation_data(relation_id, harness.model.app.name) == {}
+
+
+def test_ingress_hostname_change_does_not_restart_or_rotate_workload(harness):
+    database(harness)
+    harness.update_config({"external-hostname": "ratings.localhost"})
+    relation_id = harness.add_relation(INGRESS, "traefik")
+    original_env = environment(harness)
+    with (
+        patch.object(ops.Container, "stop") as stop,
+        patch.object(ops.Container, "restart") as restart,
+    ):
+        harness.update_config({"external-hostname": "ratings.staging.ubuntu.com"})
+        mark_ready(harness)
+    stop.assert_not_called()
+    restart.assert_not_called()
+    assert environment(harness) == original_env
+    assert ingress_config(harness, relation_id) == expected_ingress(
+        harness, "ratings.staging.ubuntu.com"
+    )
+
+
+def test_ingress_follower_does_not_publish_and_leader_elected_initialises(harness):
+    database(harness)
+    harness.set_leader(False)
+    harness.update_config({"external-hostname": "ratings.localhost"})
+    relation_id = harness.add_relation(INGRESS, "traefik")
+    harness.add_relation_unit(relation_id, "traefik/0")
+    harness.update_relation_data(relation_id, "traefik", {"external_host": "ignored.example"})
+    harness.charm.on.upgrade_charm.emit()
+    assert harness.get_relation_data(relation_id, harness.model.app.name) == {}
+    assert harness.charm.traefik_route is None
+    harness.set_leader(True)
+    assert ingress_config(harness, relation_id) == expected_ingress(harness, "ratings.localhost")
+    harness.set_leader(False)
+    harness.update_config({"external-hostname": "ratings.staging.ubuntu.com"})
+    assert ingress_config(harness, relation_id) == expected_ingress(harness, "ratings.localhost")
+    harness.set_leader(True)
+    assert ingress_config(harness, relation_id) == expected_ingress(
+        harness, "ratings.staging.ubuntu.com"
+    )
+
+
+def test_ingress_invalid_config_on_follower_is_withdrawn_when_elected(harness):
+    database(harness)
+    harness.update_config({"external-hostname": "ratings.localhost"})
+    relation_id = harness.add_relation(INGRESS, "traefik")
+    original_data = harness.get_relation_data(relation_id, harness.model.app.name).copy()
+    harness.set_leader(False)
+    harness.update_config({"external-hostname": "invalid`hostname"})
+    mark_ready(harness)
+    assert isinstance(harness.model.unit.status, ops.BlockedStatus)
+    assert harness.get_relation_data(relation_id, harness.model.app.name) == original_data
+    harness.set_leader(True)
+    assert ingress_config(harness, relation_id) == {"http": {"routers": {}, "services": {}}}
+    harness.update_config({"external-hostname": "ratings.staging.ubuntu.com"})
+    assert ingress_config(harness, relation_id) == expected_ingress(
+        harness, "ratings.staging.ubuntu.com"
+    )
+
+
+@pytest.mark.parametrize("event", ["joined", "changed", "upgrade", "leader"])
+def test_ingress_events_republish_from_current_config(harness, event):
+    harness.update_config({"external-hostname": "ratings.localhost"})
+    relation_id = harness.add_relation(INGRESS, "traefik")
+    harness.update_relation_data(relation_id, harness.model.app.name, {"config": ""})
+    if event == "joined":
+        harness.add_relation_unit(relation_id, "traefik/0")
+    elif event == "changed":
+        harness.update_relation_data(relation_id, "traefik", {"external_host": "ignored.example"})
+    elif event == "upgrade":
+        harness.charm.on.upgrade_charm.emit()
+    else:
+        harness.set_leader(True)
+    assert ingress_config(harness, relation_id) == expected_ingress(harness, "ratings.localhost")
+
+
+@pytest.mark.parametrize("hostname", ["ratings.localhost", ""])
+def test_ingress_broken_never_writes_dying_relation_or_stops_backend_and_can_recreate(
+    harness, hostname
+):
+    database(harness)
+    harness.update_config({"external-hostname": hostname})
+    relation_id = harness.add_relation(INGRESS, "traefik")
+    harness.add_relation_unit(relation_id, "traefik/0")
+    old_requirer = harness.charm.traefik_route
+    original_env = environment(harness)
+    with (
+        patch.object(
+            old_requirer, "submit_to_traefik", side_effect=AssertionError("dying relation")
+        ),
+        patch.object(ops.Container, "stop") as stop,
+    ):
+        harness.remove_relation(relation_id)
+        mark_ready(harness)
+        assert isinstance(harness.model.unit.status, ops.ActiveStatus)
+        harness.update_config({"external-hostname": "ratings.staging.ubuntu.com"})
+        new_id = harness.add_relation(INGRESS, "replacement-traefik")
+        harness.add_relation_unit(new_id, "replacement-traefik/0")
+        harness.update_relation_data(new_id, "replacement-traefik", {"scheme": "http"})
+        assert harness.charm.traefik_route is not old_requirer
+        assert isinstance(harness.charm.traefik_route, TraefikRouteRequirer)
+        assert ingress_config(harness, new_id) == expected_ingress(
+            harness, "ratings.staging.ubuntu.com"
+        )
+    stop.assert_not_called()
+    assert environment(harness) == original_env
+    assert harness.model.unit.opened_ports() == {ops.Port("tcp", PORT)}
+
+
+def test_ingress_does_not_withdraw_for_transient_backend_health(harness):
+    database(harness)
+    harness.update_config({"external-hostname": "ratings.localhost"})
+    relation_id = harness.add_relation(INGRESS, "traefik")
+    original_config = ingress_config(harness, relation_id)
+    harness.charm.on.ratings_pebble_check_failed.emit(harness.charm.container, READY_CHECK)
+    assert isinstance(harness.model.unit.status, ops.WaitingStatus)
+    assert ingress_config(harness, relation_id) == original_config
+    harness.set_can_connect(SERVICE, False)
+    harness.charm.on.update_status.emit()
+    assert ingress_config(harness, relation_id) == original_config
+    # Hostname withdrawal must work even when Pebble cannot be reached.
+    harness.update_config({"external-hostname": ""})
+    assert isinstance(harness.model.unit.status, ops.BlockedStatus)
+    assert ingress_config(harness, relation_id) == {"http": {"routers": {}, "services": {}}}
 
 
 @pytest.mark.parametrize(

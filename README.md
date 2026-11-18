@@ -10,8 +10,10 @@ A standalone sidecar operator for the existing
 [App Center Ratings](https://github.com/ubuntu/app-center-ratings) rock
 (`/bin/ratings`, Pebble service `ratings`). All charm code, vendored libraries,
 dependency locks, and tests are self-contained at this repository's root. The
-charm does **not** deploy PostgreSQL, change the rock, create an ingress, or install
-observability agents. It is specific to Ratings, not a generic container runner.
+charm does **not** deploy PostgreSQL, change the rock, deploy an ingress stack, or
+install observability agents. It can optionally publish native gRPC routes to an
+existing Traefik using `traefik_route`. It is specific to Ratings, not a generic
+container runner.
 The same charm artifact is intended for local development and Prodstacks 7 (PS7)
 Juju deployments on Kubernetes; environment-specific configuration, database offers,
 and OCI resources are supplied at deployment time. See the TLS and ingress
@@ -27,8 +29,16 @@ there are no separate `metadata.yaml`, `config.yaml`, or `actions.yaml` files.
 - Charmcraft **4.5.0**, Ubuntu **24.04**, Python **3.12**, Kubernetes sidecars.
 - The declared build/deployment platform is **amd64** only. An arm64 rock and
   additional platform declaration would be needed for arm64.
-- A compatible `postgresql_client` provider. The local lab uses PostgreSQL-k8s
+- A compatible PostgreSQL `postgresql_client` provider, including a compatible
+  PgBouncer provider in **session pooling** mode. The local lab uses PostgreSQL-k8s
   **16/stable** via its modern `database` endpoint; PS7 uses an approved DBaaS offer.
+  The relation must supply the requested database, credentials and primary endpoint,
+  plus CA data when database TLS is enabled. The user needs schema/migration
+  permissions; transaction/statement pooling is not supported (see migrations below).
+- For optional external gRPC ingress: a deployment-managed Traefik providing
+  `traefik_route`, a TLS-capable `websecure` entrypoint and a trusted certificate
+  covering `external-hostname`. Shared HAProxy, DNS, certificates, network policy
+  and reachability are deployment responsibilities, not installed by this charm.
 
 Build from this repository's root, independently of the application checkout:
 
@@ -68,6 +78,7 @@ folders because strictly confined Juju cannot read archives under `.cache`.
 | --- | --- | --- |
 | `database` | requires / `postgresql_client`, limit 1 | The configured SQL database (`ratings` by default) and relation-scoped credentials |
 | `logging` | optional requires / `loki_push_api` | Native Pebble workload stdout/stderr forwarding to COS Loki |
+| `traefik-route` | optional requires / `traefik_route`, limit 1 | Native gRPC Host routing on Traefik `websecure`, TLS termination then h2c to the Ratings Kubernetes Service |
 | `ratings-peers` | peer / `ratings_peers` | Shared JWT secret reference and rotation notification |
 
 After deployment by the rollout owner, the database relation is:
@@ -90,6 +101,8 @@ identifiers. The managed provider must expose a compatible `postgresql_client`
 relation and authorise this application to use that database; confirm credentials,
 TLS, network access, and migration permissions with the DBaaS owners. This charm
 does not provision a DBaaS instance or support arbitrary static connection secrets.
+A compatible PgBouncer relation is also supported with session pooling; the charm
+requests no provider-specific admin roles or direct connections.
 
 For COS in the separate `cos-lite` model, offer the Loki provider's `logging`
 endpoint from that model and integrate/consume that offer at **`ratings:logging`**
@@ -112,6 +125,17 @@ Config options:
   the relation**; restore the previous value to recover. A database move needs a
   separately reviewed data/credential plan, not an ordinary config toggle. Do not
   remove/recreate a managed database relation without checking its data lifecycle.
+- `external-hostname`: defaults to empty; used **only** when `traefik-route` is
+  related. Examples: `ratings.localhost` (lab), `ratings.staging.ubuntu.com` (PS7).
+  Only ASCII DNS labels of 1-63 letters/digits/hyphens, with alphanumeric ends,
+  are accepted, up to 253 characters in total. Single-label names are allowed;
+  uppercase ASCII is normalised to lowercase. URLs, ports, paths, wildcards,
+  whitespace, empty labels, trailing dots, Unicode and Traefik rule syntax are
+  rejected. An empty/invalid related hostname **blocks and replaces any previous
+  route with empty HTTP routers/services**, without stopping an otherwise healthy
+  backend. Correcting it republishes the route. With no relation, even an empty
+  hostname leaves the existing direct/lab behaviour unchanged. Ingress-only config
+  changes do not restart an unchanged Rust workload or rotate its JWT.
 - `snap-store-url`: defaults to `https://api.snapcraft.io/v2/`; must be an absolute
   HTTP(S) URL ending in `/`, with no credentials, query, or fragment. Requests
   from the service go to that URL: the default requires network access to the
@@ -133,13 +157,90 @@ APP_SNAPCRAFT_IO_URI=<snap-store-url>
 RUST_LOG=<rust-log>
 ```
 
+### Optional native gRPC ingress
+
+The leader publishes a raw Traefik dynamic HTTP configuration through the official
+`TraefikRouteRequirer(raw=True)` library. There is one model-UUID/application-unique
+router and service, with exactly:
+
+- ``rule: Host(`external-hostname`)``, `entryPoints: [websecure]`, `tls: {}`;
+- `loadBalancer.servers: [{url: "h2c://<juju-application-name>:8080"}]`.
+
+There is no `PathPrefix`, `StripPrefix`, path rewriting, HTTP entrypoint, HTTP
+fallback or TLS certificate resolver in the route. Native gRPC method paths are
+preserved. The backend target is the **Kubernetes Service**, not individual pod
+addresses: this is Kubernetes service-based balancing, **not per-RPC balancing**.
+Long-lived HTTP/2 connections can stay on one backend. This does not promise
+Kubernetes readiness gating, end-to-end health checks, availability or HA. The
+Pebble TCP check is only the charm's local listener readiness signal; transient
+backend/check failures do not cause unnecessary route withdrawal.
+
+The deployment owns the ingress stack. A shared-stack layout for **both** lab and
+PS7 is:
+
+```text
+native gRPC client
+  -> HAProxy edge (terminates client TLS, ALPN h2)
+  -> model-local Traefik websecure (new HTTPS/HTTP2 connection from HAProxy)
+  -> Ratings Kubernetes Service:8080 (plaintext HTTP/2, h2c)
+```
+
+`ingress-configurator` relates to Traefik's `upstream-ingress` and the edge's
+`haproxy-route`; it configures routing, not another proxy hop. Configure its
+`backend-protocol=https`, `paths=/`, and `allow-http=false`. The edge terminates
+client TLS and establishes a separate TLS connection to Traefik, negotiating
+HTTP/2 on both hops; this is **not TCP/SNI passthrough**. Traefik's server CA must
+be transferred to the edge for backend trust. The pinned HAProxy 551 verifies the
+backend CA but does not render backend SNI or hostname verification; account for
+that upstream limitation in the trust boundary.
+
+PS7 reuses the Desktop edge; the lab deploys a separate HAProxy machine charm in
+LXD with private lab certificates. DNS/host forwarding must reach HAProxy, clients
+must trust its public-facing certificate, and Traefik must resolve and reach
+`h2c://<ratings-app-name>:8080`. This short Service name normally requires
+Traefik and Ratings in the **same Kubernetes model/namespace**. A relation alone
+cannot provide cross-namespace/cluster DNS, routing or network-policy access.
+
+Once the deployment owner has supplied the stack, the **lab** relation/config
+example (Ratings app `ratings`, existing Traefik app `traefik` in `ratings-dev`) is:
+
+```sh
+juju config -m ratings-k8s:ratings-dev ratings external-hostname=ratings.localhost
+juju integrate -m ratings-k8s:ratings-dev ratings:traefik-route traefik:traefik-route
+```
+
+For **PS7 staging**, replace `PS7_CONTROLLER:STAGING_MODEL` with the approved
+controller/model and `traefik` with the deployment's existing, reachable provider
+in the same model/namespace. Keep the HAProxy host route, DNS, edge certificate,
+and Traefik certificate aligned with `ratings.staging.ubuntu.com`. The operations
+Terraform owns these settings and relations; the commands below illustrate the
+contract, not an alternative to its reviewed apply workflow:
+
+```sh
+juju config -m PS7_CONTROLLER:STAGING_MODEL ratings \
+  external-hostname=ratings.staging.ubuntu.com
+juju integrate -m PS7_CONTROLLER:STAGING_MODEL ratings:traefik-route traefik:traefik-route
+```
+
+These are configuration examples, **not live-validated ingress deployments**.
+The charm does not deploy HAProxy/Traefik, allocate addresses, publish DNS, issue
+certificates or configure client trust. The empty `tls` map enables TLS termination
+on Traefik; certificate provisioning/default-certificate selection is external.
+Removing the optional ingress relation does not stop a healthy Ratings backend,
+and the charm does not write to the dying relation. Relation creation/join/change,
+config changes, leadership and charm upgrades republish the current configuration.
+Only the leader writes application routing data; followers still validate config.
+
 ### TLS scope
 
-The Ratings **gRPC listener is currently plaintext in all environments**, including
-PS7. `APP_TLS_KEY_PATH` and `APP_TLS_KEYCHAIN_PATH` are left unset. Port **8080/TCP** is opened using
-`unit.set_ports(8080)`; that does not create external ingress or imply TLS.
-Do not expose this deployment on an untrusted network. Production listener TLS,
-certificate relations, ingress, and access policy are not implemented here.
+The Ratings **gRPC listener remains plaintext in all environments**, including
+PS7. `APP_TLS_KEY_PATH` and `APP_TLS_KEYCHAIN_PATH` are left unset. Port **8080/TCP**
+is opened using `unit.set_ports(8080)`; that alone does not create external ingress
+or imply TLS. Optional ingress protects the client-to-Traefik path as deployed
+above, but the **final Traefik-to-Ratings hop is plaintext h2c**, not end-to-end TLS.
+Keep it on a trusted/restricted network; do not expose port 8080 directly on an
+untrusted network. Workload listener TLS, certificate relations, and access policy
+are not implemented here.
 
 Database TLS is handled separately. With `tls=False` (or no TLS flag), the SQLx
 URI uses `sslmode=disable`, matching the lab's default. With `tls=True`, the charm
@@ -191,9 +292,11 @@ credentials nor copies them into stored state or relation databags.
 ## Lifecycle and migrations
 
 Before database credentials and the shared JWT are available, the charm disables
-and stops even the image's default startup-enabled service. Invalid configuration
-blocks; pending database data, unavailable secrets, container connectivity, or
-readiness waits. Database relation removal stops Ratings, disables its check,
+and stops even the image's default startup-enabled service. Invalid workload
+configuration blocks and stops it; invalid optional ingress configuration blocks
+and withdraws the route without stopping a healthy backend. Pending database data,
+unavailable secrets, container connectivity, or readiness result in Waiting.
+Database relation removal stops Ratings, disables its check,
 erases the stale service environment/CA file, and closes the port. If Pebble is
 unreachable at removal, the port is closed immediately and stopping is retried
 once it is reachable. Database restoration reconfigures and starts the service.
@@ -229,6 +332,17 @@ and calls `conn.lock()`/`unlock()`; `sqlx-postgres/src/migrate.rs` uses
 `pg_advisory_lock`/`pg_advisory_unlock` with a database-derived lock ID. Concurrent
 units serialize migrations through PostgreSQL itself. **No explicit charm
 migration leader, migration Job, or extra PostgreSQL Python driver is necessary.**
+PgBouncer must use **session pooling** so these session-scoped advisory locks and
+SQLx's prepared statements retain the same PostgreSQL session. Transaction or
+statement pooling is not compatible with this startup/migration model.
+
+The application source removes an obsolete database-name-specific `CONNECT` grant
+from its initial migration. Rebuild the rock to include the correction; repacking
+only this charm does not change embedded SQL. Existing labs or restored databases
+may need explicitly approved reconciliation of the known initial checksum; see
+the application's
+[database migration runbook](https://github.com/ubuntu/app-center-ratings/blob/main/doc/database-migrations.md).
+The charm does not disable SQLx checksum checks or repair migration records.
 
 ## Dependencies, provenance, and tests
 
@@ -239,6 +353,12 @@ and SHA-256 in `libraries.lock.json`:
   `87e246a5392e9d3dd5c084a824a83c4bc1c34b77`; `PYDEPS`: `ops>=2.0.0`.
 - `charms.loki_k8s.v1.loki_push_api`, **API 1 / patch 35**, commit
   `dbc2e7d78fcde4be11ae5328e7c882904befadf3`; `PYDEPS`: `cosl`.
+- `charms.traefik_k8s.v0.traefik_route`, **API 0 / patch 7**, commit
+  `99734ac72fda56b8d6138e411af343bc76c1fb9f`, `LIBID`
+  `f0d93d2bdf354b99a527463a9c49fce3`, SHA-256
+  `c727ee26196f9604a7d77cadbaa7bd26d8dfd82d246dc7310e0257e838704c09`.
+  This pinned upstream file has **no `PYDEPS` declaration**; its `ops` and `yaml`
+  imports are already supplied by the existing locked dependencies.
 
 These pinned versions have no other mandatory charm-library imports. The Loki
 library imports `cosl` for topology/rules helpers (the library's older prose about
@@ -249,7 +369,9 @@ The sidecar code and tests were copied from `ubuntu/app-center-ratings/charm`
 without modification, including its **GPL-3.0** [`LICENSE`](LICENSE). This migration
 does not relicense that code as Apache. Apache-2.0 licensing for vendored Canonical
 libraries is preserved in their headers, [`lib/LICENSE.loki-k8s`](lib/LICENSE.loki-k8s),
-and [`LICENSE.apache-2.0`](LICENSE.apache-2.0). The latter also preserves the original
+[`lib/LICENSE.traefik-k8s`](lib/LICENSE.traefik-k8s), and
+[`LICENSE.apache-2.0`](LICENSE.apache-2.0). The Traefik library and its upstream
+license are vendored unmodified. The root Apache license also preserves the original
 repository's Copyright 2023 Canonical license notice for retained repository
 infrastructure. The legacy machine implementation remains on `main` under its
 original license. The repository's Canonical CLA policy still applies; see
@@ -271,11 +393,12 @@ python3 -m venv .venv
 .venv/bin/python -m pytest -q --cov=charm --cov-report=term-missing
 .venv/bin/ruff check src tests
 .venv/bin/ruff format --check src tests
+.venv/bin/python -m pip check
 ```
 
-The migrated suite contains **110 unit tests** and targets **99% charm-code
-coverage**. It includes immutable database-name guards before the relation
-library's eager writes, standard-Base64 JWT creation/rotation, zero/unknown
+The offline suite targets **99% charm-code coverage**. It includes immutable
+database-name guards before the relation library's eager writes,
+standard-Base64 JWT creation/rotation, zero/unknown
 success counts with successful, refused, and timed-out TCP probes, non-UP checks,
 check events without service restarts, and readiness reset after restart.
 CI runs these offline tests, Ruff lint/format checks, and packs the charm; it does
@@ -288,6 +411,11 @@ vendored libraries and fake Juju/Pebble/database data. They cover provisioning,
 secret-backed and plaintext credentials, URI encoding, TLS/CA rotation, stable
 leader/follower JWT ownership and rotation, invalid configuration, readiness,
 ports, stop/recovery, disconnected containers, safe actionable failures, and
-real Loki target/label/removal behaviour. The vendored checksums are also tested.
+real Loki target/label/removal behaviour. Real-library ingress tests cover exact
+raw TLS/h2c routing, hostname validation/normalisation and stale-route withdrawal,
+app/model naming, optional/no-relation behaviour, leader/follower writes, config
+changes without workload restart, relation recreation, leadership and upgrades.
+The vendored checksums are also tested. These tests do not establish live gRPC,
+certificate, readiness or HA behaviour.
 Upstream `JujuVersion.from_environ()` deprecation warnings are expected with this
 Ops version; vendored libraries are not modified to suppress them.

@@ -3,8 +3,9 @@ name: ratings
 summary: Kubernetes sidecar operator for the App Center Ratings service
 description: |
   Runs the Ratings gRPC backend using Pebble, a relation-provisioned PostgreSQL
-  database, and an application-owned Juju JWT secret. Supports local development
-  and Prodstacks 7 (PS7) Juju deployments on Kubernetes.
+  database, and an application-owned Juju JWT secret. Optionally publishes native
+  gRPC ingress routes to an existing Traefik over traefik_route. Supports local
+  development and Prodstacks 7 (PS7) Juju deployments on Kubernetes.
 base: ubuntu@24.04
 platforms:
   amd64:
@@ -27,6 +28,10 @@ requires:
   logging:
     interface: loki_push_api
     optional: true
+  traefik-route:
+    interface: traefik_route
+    limit: 1
+    optional: true
 peers:
   ratings-peers:
     interface: ratings_peers
@@ -40,6 +45,16 @@ config:
         service name or Juju offer URL). Set before relating the database.
         Use 1-63 ASCII letters, digits, underscores or hyphens, not a leading
         hyphen. Changing it on an existing relation blocks the workload.
+    external-hostname:
+      type: string
+      default: ""
+      description: |
+        DNS hostname for optional Traefik gRPC ingress, e.g. ratings.localhost or
+        ratings.staging.ubuntu.com. Required only when traefik-route is related.
+        ASCII DNS labels of 1-63 characters, at most 253 total; no URLs, ports,
+        paths, wildcards or trailing dot. Normalised to lowercase in Host rules.
+        The deployment supplies ingress, DNS and certificates; the final hop to
+        Ratings uses plaintext HTTP/2 (h2c).
     snap-store-url:
       type: string
       default: https://api.snapcraft.io/v2/
